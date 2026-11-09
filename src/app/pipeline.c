@@ -1254,6 +1254,31 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
     FunctionList funcs = {0};
     SMCAnalysis smc = {0};
 
+    // Every chunk entry, so cross-chunk `bl`s can call their target directly.
+    u32 chunk_start_count = 0;
+    for (u32 s = 0; s < section_count; s++)
+        if (sections[s].size && sections[s].data)
+            chunk_start_count += (sections[s].size / 4u + chunk_instructions - 1u) / chunk_instructions;
+    u32* chunk_starts = (u32*)calloc(chunk_start_count ? chunk_start_count : 1u, sizeof(u32));
+    if (!chunk_starts) {
+        fprintf(stderr, "error: out of memory\n");
+        fclose(header);
+        fclose(manifest);
+        return 0;
+    }
+    chunk_start_count = 0;
+    for (u32 s = 0; s < section_count; s++) {
+        if (!sections[s].size || !sections[s].data) continue;
+        for (u32 start = 0; start < sections[s].size / 4u; start += chunk_instructions)
+            chunk_starts[chunk_start_count++] = sections[s].address + start * 4u;
+    }
+    // Sections are not guaranteed to be address-ordered; chunk_start_for binary-searches.
+    for (u32 i = 1; i < chunk_start_count; i++)
+        for (u32 j = i; j > 0 && chunk_starts[j - 1] > chunk_starts[j]; j--) {
+            u32 t = chunk_starts[j]; chunk_starts[j] = chunk_starts[j - 1]; chunk_starts[j - 1] = t;
+        }
+    emit_set_chunk_table(chunk_starts, chunk_start_count);
+
     for (u32 s = 0; s < section_count; s++) {
         const LoadedCodeSection* section = &sections[s];
         if (section->size == 0 || !section->data) continue;

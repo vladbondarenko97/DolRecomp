@@ -364,7 +364,11 @@ static bool emit_cross_chunk_call(FILE* out, const PPCInst* inst,
         return false;
 
     fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
-    fprintf(out, "            if (dolrecomp_call_enter()) {\n");
+    // The chassis vets every dispatch (SMC-verified chunk, mod hooks, forced
+    // fallback ranges); ask it the same about the target before skipping it.
+    fprintf(out, "            if (ppc_native_region_available(ctx, 0x%08Xu, 0x%08Xu) &&\n",
+            inst->branch_target, inst->branch_target + 4u);
+    fprintf(out, "                dolrecomp_call_enter()) {\n");
     fprintf(out, "                void func_%08X(CPUState* ctx);\n", target_chunk);
     fprintf(out, "                func_%08X(ctx);\n", target_chunk);
     fprintf(out, "                dolrecomp_call_leave();\n");
@@ -1610,6 +1614,15 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_DCBST:
     case PPC_OP_DCBF:
     case PPC_OP_DCBI:
+        // DCFlushRange loops run thousands of these per frame; returning to
+        // the chassis after each one doubled the dispatch count. Data-cache
+        // ops change no code, so carry on unless the fallback redirected pc.
+        fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
+                inst->raw, inst->address);
+        fprintf(out, "    if (ctx->exception || ctx->pc != 0x%08Xu) return;\n",
+                inst->address + 4u);
+        break;
+
     case PPC_OP_ICBI:
         fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
                 inst->raw, inst->address);
