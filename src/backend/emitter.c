@@ -2,6 +2,10 @@
 // Copyright (C) 2026 ExpansionPak
 
 #include "emitter.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "backend/c_cfg.h"
 
 static u32 cr_field_shift(u8 crf) {
@@ -422,7 +426,7 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst,
 static void emit_dynamic_branch(FILE* out, const PPCInst* inst,
                                 const char* target_expr,
                                 bool route_local_returns,
-                                u32 function_address) {
+                                u32 function_address, u32 func_end) {
     fprintf(out, "    {\n");
     fprintf(out, "        u32 target = %s;\n", target_expr);
     emit_branch_condition(out, inst->bo, inst->bi);
@@ -431,6 +435,28 @@ static void emit_dynamic_branch(FILE* out, const PPCInst* inst,
         fprintf(out, "            ctx->lr = 0x%08Xu;\n", inst->address + 4);
     }
     fprintf(out, "            ctx->pc = target;\n");
+    // Indirect calls (blrl/bctrl: virtual calls) stay native like emit_cross_chunk_call:
+    // same chassis check, the target's chunk from the module's address table, resume
+    // inline if the callee came back to the next instruction. Anything else: as before.
+    const u32 continuation = inst->address + 4u;
+    static int native_indirect = -1;  // DOLRECOMP_C_NATIVE_INDIRECT=0 turns this off
+    if (native_indirect < 0) {
+        const char* env = getenv("DOLRECOMP_C_NATIVE_INDIRECT");
+        native_indirect = !env || env[0] != '0';
+    }
+    if (native_indirect && inst->lk && branch_target_is_local(function_address, func_end, continuation)) {
+        fprintf(out, "            {\n");
+        fprintf(out, "                DolRecompFunction fn = dolrecomp_find_original(target);\n");
+        fprintf(out, "                if (fn && ppc_native_region_available(ctx, target, target + 4u) &&\n");
+        fprintf(out, "                    dolrecomp_call_enter()) {\n");
+        fprintf(out, "                    fn(ctx);\n");
+        fprintf(out, "                    dolrecomp_call_leave();\n");
+        fprintf(out, "                    if (ctx->pc == 0x%08Xu) goto label_%08X;\n",
+                continuation, continuation);
+        fprintf(out, "                    return;\n");
+        fprintf(out, "                }\n");
+        fprintf(out, "            }\n");
+    }
     if (route_local_returns)
         fprintf(out, "            goto return_dispatch_%08X;\n", function_address);
     else
@@ -513,24 +539,24 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "#define DOLRECOMP_C_MAX_CALL_DEPTH 24\n"
         "#endif\n"
         "extern unsigned dolrecomp_call_depth;\n"
-        "static inline int dolrecomp_call_enter(void) {\n"
+        "static inline __attribute__((always_inline)) int dolrecomp_call_enter(void) {\n"
         "    if (dolrecomp_call_depth >= (unsigned)DOLRECOMP_C_MAX_CALL_DEPTH)\n"
         "        return 0;\n"
         "    dolrecomp_call_depth++;\n"
         "    return 1;\n"
         "}\n"
-        "static inline void dolrecomp_call_leave(void) {\n"
+        "static inline __attribute__((always_inline)) void dolrecomp_call_leave(void) {\n"
         "    if (dolrecomp_call_depth)\n"
         "        dolrecomp_call_depth--;\n"
         "}\n"
         "\n"
-        "static inline u32 dolrecomp_rotl32(u32 value, u32 sh) {\n"
+        "static inline __attribute__((always_inline)) u32 dolrecomp_rotl32(u32 value, u32 sh) {\n"
         "    sh &= 31u;\n"
         "    return sh ? ((value << sh) | (value >> (32u - sh))) : value;\n"
         "}\n"
         "\n"
         // Preserve the PPC bit-level single conversion, including denormals.
-        "static inline f64 dolrecomp_f32_from_bits(u32 bits) {\n"
+        "static inline __attribute__((always_inline)) f64 dolrecomp_f32_from_bits(u32 bits) {\n"
         "    u64 x = bits;\n"
         "    u64 exp = (x >> 23) & 0xFFu;\n"
         "    u64 frac = x & 0x007FFFFFu;\n"
@@ -559,7 +585,7 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "    return value;\n"
         "}\n"
         "\n"
-        "static inline u32 dolrecomp_f32_to_bits(f64 value) {\n"
+        "static inline __attribute__((always_inline)) u32 dolrecomp_f32_to_bits(f64 value) {\n"
         "    u64 bits;\n"
         "    memcpy(&bits, &value, sizeof(bits));\n"
         "    u32 exp = (u32)((bits >> 52) & 0x7FFu);\n"
@@ -578,25 +604,43 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "                 ((bits >> 29) & 0x3FFFFFFFu));\n"
         "}\n"
         "\n"
-        "static inline f64 dolrecomp_f64_from_bits(u64 bits) {\n"
+        "static inline __attribute__((always_inline)) f64 dolrecomp_f64_from_bits(u64 bits) {\n"
         "    f64 value;\n"
         "    memcpy(&value, &bits, sizeof(value));\n"
         "    return value;\n"
         "}\n"
         "\n"
-        "static inline u64 dolrecomp_f64_to_bits(f64 value) {\n"
+        "static inline __attribute__((always_inline)) u64 dolrecomp_f64_to_bits(f64 value) {\n"
         "    u64 bits;\n"
         "    memcpy(&bits, &value, sizeof(bits));\n"
         "    return bits;\n"
         "}\n"
         "\n"
-        "static inline f64 dolrecomp_ps_from_bits(u32 bits) {\n"
+        "static inline __attribute__((always_inline)) f64 dolrecomp_ps_from_bits(u32 bits) {\n"
         "    return dolrecomp_f32_from_bits(bits);\n"
         "}\n"
         "\n"
-        "static inline u32 dolrecomp_ps_to_bits(f64 value) {\n"
+        "static inline __attribute__((always_inline)) u32 dolrecomp_ps_to_bits(f64 value) {\n"
         "    return dolrecomp_f32_to_bits(value);\n"
         "}\n"
+        "\n"
+        "// GameCube fast-mem: generated functions keep the RAM base in a local (dolrecomp_ram),\n"
+        "// which survives calls, instead of reloading ctx->ram at every access.\n"
+        "#if defined(GXRUNTIME_GC_FAST_MEM) && !defined(DOLRECOMP_NO_RAM_LOCAL)\n"
+        "#define DOLRECOMP_RAM_LOCAL u8* const dolrecomp_ram = ctx->ram; (void)dolrecomp_ram;\n"
+        "#define mem_read8(c, a) gx_rb_read8((c), dolrecomp_ram, (a))\n"
+        "#define mem_read16(c, a) gx_rb_read16((c), dolrecomp_ram, (a))\n"
+        "#define mem_read32(c, a) gx_rb_read32((c), dolrecomp_ram, (a))\n"
+        "#define mem_read64(c, a) gx_rb_read64((c), dolrecomp_ram, (a))\n"
+        "#define mem_write8(c, a, v) gx_rb_write8((c), dolrecomp_ram, (a), (v))\n"
+        "#define mem_write16(c, a, v) gx_rb_write16((c), dolrecomp_ram, (a), (v))\n"
+        "#define mem_write32(c, a, v) gx_rb_write32((c), dolrecomp_ram, (a), (v))\n"
+        "#define mem_write64(c, a, v) gx_rb_write64((c), dolrecomp_ram, (a), (v))\n"
+        "#define DOLRECOMP_RAM_SPAN(a, n) (GX_RB_IN_RAM(GX_RB_OFFSET(a), (n)) ? dolrecomp_ram + GX_RB_OFFSET(a) : (u8*)0)\n"
+        "#else\n"
+        "#define DOLRECOMP_RAM_SPAN(a, n) ((u8*)0)\n"
+        "#define DOLRECOMP_RAM_LOCAL\n"
+        "#endif\n"
         "\n"
         ,
         emit_cpu_label(cpu),
@@ -612,6 +656,18 @@ void emit_footer(FILE* out) {
     fprintf(out, "\n#endif /* RECOMP_GENERATED_H */\n\n// end\n");
 }
 
+static bool s_fp_checked;
+
+static void fp_check_before(const CFunctionCFG* cfg, u32 i) {
+    if (i == 0 || cfg->leaders[i] || (cfg->entries && cfg->entries[i]))
+        s_fp_checked = false;
+}
+
+static void fp_check_after(const PPCInst* inst) {
+    if (!ppc_op_uses_fpu(inst->op) && !c_inst_preserves_msr(inst))
+        s_fp_checked = false;
+}
+
 static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
                                         u32 func_start, u32 func_end,
                                         bool direct_backedge,
@@ -625,8 +681,12 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         return;
     }
 
-    if (ppc_op_uses_fpu(inst->op))
+    // One FP-available check per straight-line run: s_fp_checked is cleared by the callers at
+    // block leaders/entries and after anything that might change MSR.
+    if (ppc_op_uses_fpu(inst->op) && !s_fp_checked) {
         fprintf(out, "    if (!ppc_fp_available_inline(ctx, 0x%08Xu)) return;\n", inst->address);
+        s_fp_checked = true;
+    }
 
     switch (inst->op) {
     case PPC_OP_MULLI:
@@ -1639,8 +1699,11 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         fprintf(out, "        u32 ea = ");
         emit_dform_ea(out, inst->rA, inst->simm, false);
         fprintf(out, ";\n");
-        fprintf(out, "        for (u32 r = %u; r < 32; r++, ea += 4) ctx->gpr[r] = mem_read32(ctx, ea);\n",
+        // One bounds check for the whole span when it is plain RAM (DOLRECOMP_RAM_SPAN).
+        fprintf(out, "        u8* span = DOLRECOMP_RAM_SPAN(ea, %uu);\n", (32u - inst->rD) * 4u);
+        fprintf(out, "        if (span) { for (u32 r = %u; r < 32; r++, span += 4) ctx->gpr[r] = read_be32(span); }\n",
                 inst->rD);
+        fprintf(out, "        else gx_lmw_slow(ctx, ea, %uu);\n", inst->rD);
         fprintf(out, "    }\n");
         break;
 
@@ -1649,8 +1712,10 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         fprintf(out, "        u32 ea = ");
         emit_dform_ea(out, inst->rA, inst->simm, false);
         fprintf(out, ";\n");
-        fprintf(out, "        for (u32 r = %u; r < 32; r++, ea += 4) mem_write32(ctx, ea, ctx->gpr[r]);\n",
+        fprintf(out, "        u8* span = DOLRECOMP_RAM_SPAN(ea, %uu);\n", (32u - inst->rS) * 4u);
+        fprintf(out, "        if (span) { for (u32 r = %u; r < 32; r++, span += 4) write_be32(span, ctx->gpr[r]); }\n",
                 inst->rS);
+        fprintf(out, "        else gx_stmw_slow(ctx, ea, %uu);\n", inst->rS);
         fprintf(out, "    }\n");
         break;
 
@@ -1675,11 +1740,11 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
 
     case PPC_OP_BCLR:
         emit_dynamic_branch(out, inst, "ctx->lr & ~3u",
-                            route_local_returns, func_start);
+                            route_local_returns, func_start, func_end);
         break;
 
     case PPC_OP_BCCTR:
-        emit_dynamic_branch(out, inst, "ctx->ctr & ~3u", false, func_start);
+        emit_dynamic_branch(out, inst, "ctx->ctr & ~3u", false, func_start, func_end);
         break;
 
     case PPC_OP_TWI:
@@ -1891,6 +1956,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
 }
 
 void emit_instruction(FILE* out, const PPCInst* inst) {
+    s_fp_checked = false;
     emit_instruction_with_range(out, inst, 0, (u32)-1, false, false);
 }
 
@@ -1900,14 +1966,17 @@ static void emit_counted_loop(FILE* out, const PPCInst* insts,
     u32 loop_address = insts[first].address;
     u32 continuation = insts[last].address + 4u;
 
-    fprintf(out, "static void loop_%08X(CPUState* ctx) {\n", loop_address);
+    fprintf(out, "static void loop_%08X(CPUState* __restrict ctx) {\n", loop_address);
+    fprintf(out, "    DOLRECOMP_RAM_LOCAL\n");
     fprintf(out, "label_%08X:\n", loop_address);
     fprintf(out, "    ctx->downcount -= %u;\n", cfg->block_cycles[first]);
     for (u32 i = first; i <= last; ++i) {
         if (cfg->materialize_pc[i])
             fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
+        fp_check_before(cfg, i);
         emit_instruction_with_range(out, &insts[i], function_address,
                                     function_end, i == last, false);
+        fp_check_after(&insts[i]);
     }
     fprintf(out, "    ctx->pc = 0x%08Xu;\n", continuation);
     fprintf(out, "}\n\n");
@@ -1933,13 +2002,71 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
                               cfg.loop_ends[i]);
     }
 
-    fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
+    // Sparse entries: only an instruction whose emitted code can leave the function (a
+    // `return`: branches, FP-unavailable checks, fallbacks) needs a resume label after it.
+    // Decided from the code itself, by emitting each instruction once into memory.
+    bool any_sparse = false;
+    for (u32 i = 0; i < count; ++i)
+        any_sparse |= !cfg.entries[i];
+    // An instruction that can return is also resumed AT itself (an FP-unavailable exception
+    // from the lazy FPU switch comes back to the faulting instruction), so it is an entry too.
+    if (any_sparse) {
+        u8* exits = (u8*)calloc(count ? count : 1u, 1);
+        for (u32 i = 0; exits && i < count; ++i) {
+            char* text = NULL;
+            size_t text_size = 0;
+            FILE* probe = open_memstream(&text, &text_size);
+            exits[i] = 1;
+            s_fp_checked = true;  // the FP check is placed (and made an entry) below
+            if (probe) {
+                emit_instruction_with_range(
+                    probe, &insts[i], func_addr, func_end,
+                    c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),
+                    has_local_returns);
+                fclose(probe);
+                exits[i] = !text || strstr(text, "return") != NULL;
+                free(text);
+            }
+        }
+        for (u32 i = 1; i < count; ++i)
+            cfg.entries[i] |= !exits || exits[i] || exits[i - 1u];
+        free(exits);
+    }
+    // Place the FP-available checks exactly as the emission loop below will; a check returns
+    // to resume AT its instruction, so that instruction must be an entry.
+    s_fp_checked = false;
+    for (u32 i = 0; i < count; ++i) {
+        fp_check_before(&cfg, i);
+        if (ppc_op_uses_fpu(insts[i].op) && !s_fp_checked) {
+            cfg.entries[i] = 1;
+            s_fp_checked = true;
+        }
+        fp_check_after(&insts[i]);
+    }
+    s_fp_checked = false;
+
+    fprintf(out, "void func_%08X(CPUState* __restrict ctx) {\n", func_addr);
+    fprintf(out, "    DOLRECOMP_RAM_LOCAL\n");
     fprintf(out, "    switch (ctx->pc) {\n");
+    bool sparse_entries = false;
     for (u32 i = 0; i < count; i++) {
+        if (!cfg.entries[i]) {
+            sparse_entries = true;
+            continue;
+        }
         fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
                 insts[i].address, insts[i].address);
     }
-    fprintf(out, "    default: return;\n");
+    if (sparse_entries) {
+        // Entered mid-block (after an interpreted instruction or an exception return): step
+        // one instruction in the interpreter; the dispatcher re-enters at the next PC.
+        fprintf(out, "    default:\n");
+        fprintf(out, "        if (ctx->pc >= 0x%08Xu && ctx->pc < 0x%08Xu)\n", func_addr, func_end);
+        fprintf(out, "            ppc_fallback_instruction(ctx, mem_read32(ctx, ctx->pc), ctx->pc);\n");
+        fprintf(out, "        return;\n");
+    } else {
+        fprintf(out, "    default: return;\n");
+    }
     fprintf(out, "    }\n");
 
     for (u32 i = 0; i < count; i++) {
@@ -1958,10 +2085,12 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
             fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
         if (cfg.leaders[i] && cfg.block_cycles[i] != 0)
             fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[i]);
+        fp_check_before(&cfg, i);
         emit_instruction_with_range(
             out, &insts[i], func_addr, func_end,
             c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),
             has_local_returns);
+        fp_check_after(&insts[i]);
     }
 
     fprintf(out, "    ctx->pc = 0x%08Xu;\n", func_end);

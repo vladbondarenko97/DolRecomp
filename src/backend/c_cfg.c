@@ -244,6 +244,25 @@ static bool instruction_is_outlinable(const PPCInst* inst) {
     }
 }
 
+// Integer loads and stores: emitted inline (mem_read/mem_write), never leave the block and
+// pass no PC anywhere that matters, so they need no ctx->pc store either.
+static bool instruction_is_int_memory(const PPCInst* inst) {
+    switch (inst->op) {
+    case PPC_OP_LBZ: case PPC_OP_LBZU: case PPC_OP_LBZUX: case PPC_OP_LBZX:
+    case PPC_OP_LHA: case PPC_OP_LHAU: case PPC_OP_LHAUX: case PPC_OP_LHAX:
+    case PPC_OP_LHZ: case PPC_OP_LHZU: case PPC_OP_LHZUX: case PPC_OP_LHZX:
+    case PPC_OP_LWZ: case PPC_OP_LWZU: case PPC_OP_LWZUX: case PPC_OP_LWZX:
+    case PPC_OP_LHBRX: case PPC_OP_LWBRX: case PPC_OP_LMW:
+    case PPC_OP_STB: case PPC_OP_STBU: case PPC_OP_STBUX: case PPC_OP_STBX:
+    case PPC_OP_STH: case PPC_OP_STHU: case PPC_OP_STHUX: case PPC_OP_STHX:
+    case PPC_OP_STW: case PPC_OP_STWU: case PPC_OP_STWUX: case PPC_OP_STWX:
+    case PPC_OP_STHBRX: case PPC_OP_STWBRX: case PPC_OP_STMW:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool c_function_cfg_contains(const CFunctionCFG* cfg, u32 function_address,
                              u32 address) {
     u32 end = function_address + cfg->count * 4u;
@@ -264,12 +283,14 @@ bool c_function_cfg_build(CFunctionCFG* cfg, const PPCInst* insts, u32 count,
         (u8*)calloc(count ? count : 1u, sizeof(*cfg->return_targets));
     cfg->loop_ends =
         (u32*)malloc((count ? count : 1u) * sizeof(*cfg->loop_ends));
+    cfg->entries = (u8*)malloc((count ? count : 1u) * sizeof(*cfg->entries));
     if (!cfg->leaders || !cfg->block_cycles || !cfg->materialize_pc ||
-        !cfg->return_targets || !cfg->loop_ends) {
+        !cfg->return_targets || !cfg->loop_ends || !cfg->entries) {
         c_function_cfg_destroy(cfg);
         return false;
     }
     memset(cfg->materialize_pc, 1, count ? count : 1u);
+    memset(cfg->entries, 1, count ? count : 1u);
     for (u32 i = 0; i < (count ? count : 1u); ++i)
         cfg->loop_ends[i] = UINT32_MAX;
 
@@ -324,6 +345,19 @@ bool c_function_cfg_build(CFunctionCFG* cfg, const PPCInst* insts, u32 count,
         if (straight_line && outlinable && first < last)
             cfg->loop_ends[first] = last;
     }
+
+    // On by default (busy lots 35-48 -> 60 fps on the Mac); DOLRECOMP_C_SPARSE_ENTRIES=0 restores
+    // an entry and a PC store at every instruction.
+    const char* sparse = getenv("DOLRECOMP_C_SPARSE_ENTRIES");
+    if (!sparse || sparse[0] != '0') {
+        for (u32 i = 0; i < count; ++i) {
+            if (instruction_is_pc_transparent(&insts[i]) || instruction_is_int_memory(&insts[i]))
+                cfg->materialize_pc[i] = 0;
+            // The emitter adds the instruction after anything whose code can return.
+            cfg->entries[i] = i == 0 || cfg->leaders[i] || cfg->return_targets[i] ||
+                              cfg->loop_ends[i] != UINT32_MAX;
+        }
+    }
     return true;
 }
 
@@ -331,6 +365,7 @@ void c_function_cfg_destroy(CFunctionCFG* cfg) {
     free(cfg->leaders);
     free(cfg->block_cycles);
     free(cfg->materialize_pc);
+    free(cfg->entries);
     free(cfg->return_targets);
     free(cfg->loop_ends);
     memset(cfg, 0, sizeof(*cfg));
@@ -357,4 +392,10 @@ bool c_function_cfg_can_loop_directly(const CFunctionCFG* cfg,
         }
     }
     return true;
+}
+
+// ALU ops and integer loads/stores can't change MSR (no exceptions taken inline, no calls
+// that return), so an FP-available check before them still holds after them.
+bool c_inst_preserves_msr(const PPCInst* inst) {
+    return instruction_is_pc_transparent(inst) || instruction_is_int_memory(inst);
 }
